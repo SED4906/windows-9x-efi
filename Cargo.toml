@@ -1,0 +1,13 @@
+[package]
+name = "windows-9x-efi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies.uefi]
+version = "0.34.1"
+features = ["alloc", "global_allocator"]
+
+[[bin]]
+name = "windows-9x-efi"
+test = false
+bench = false
