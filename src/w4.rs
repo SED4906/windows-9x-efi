@@ -110,7 +110,7 @@ fn ds_read_bits(input: &[u8], index_bits: &mut usize) -> DSToken {
         }
         let count = ds_count(input, index_bits);
         if count == 0 {
-            println!("<invalid count 0 with depth {depth} at {index_bits}> ");
+            panic!("invalid count 0 with depth {depth} at {index_bits} bits");
         }
         return DSToken::DepthCount(depth, count);
     } else {
@@ -126,7 +126,7 @@ fn ds_read_bits(input: &[u8], index_bits: &mut usize) -> DSToken {
         }
         let count = ds_count(input, index_bits);
         if count == 0 {
-            println!("<invalid count 0 with depth {depth}> at {index_bits}");
+            panic!("invalid count 0 with depth {depth} at {index_bits} bits");
         }
         return DSToken::DepthCount(depth, count);
     }
@@ -150,7 +150,7 @@ fn ds_decode(input: &[u8]) -> Vec<u8> {
             }
             DSToken::DepthCount(depth, count) => {
                 for _ in 0..count {
-                    let byte = result[result.len()-(depth as usize)];
+                    let byte = result[result.len() - (depth as usize)];
                     result.push(byte);
                 }
             }
@@ -165,30 +165,43 @@ fn ds_decode(input: &[u8]) -> Vec<u8> {
     result
 }
 
+fn w4_chunk_get_offset(input: &Vec<u8>, wx_vxd_offset: usize, index: usize) -> usize {
+    u32::from_le_bytes(
+        input[wx_vxd_offset + 16 + 4 * index..wx_vxd_offset + 16 + 4 * index + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize
+}
+
 /// W4 to W3
 /// # Parameters
 /// input: The compressed VxD archive.
 /// # Returns
 /// A decompressed W3 archive.
-pub fn w4_to_w3(input: Vec<u8>) -> Vec<u8> {
+pub fn w4_to_w3(input: Vec<u8>) -> (Vec<u8>, usize) {
     let wx_vxd_offset = u32::from_le_bytes(input[0x3C..0x40].try_into().unwrap()) as usize;
-    println!("Wx VxD header offset: {wx_vxd_offset:x}");
-    if input[wx_vxd_offset] != b'W' || !(input[wx_vxd_offset+1] == b'3' || input[wx_vxd_offset+1] == b'4') {
-        panic!("invalid kernel image format (expected W4 or W3)");
+    println!("Wx VxD header offset: {wx_vxd_offset:X}h");
+    if input[wx_vxd_offset] != b'W'
+        || !(input[wx_vxd_offset + 1] == b'3' || input[wx_vxd_offset + 1] == b'4')
+    {
+        panic!("invalid kernel image signature (expected W4 or W3)");
     }
-    if input[wx_vxd_offset] == b'W' && input[wx_vxd_offset+1] == b'3' {
-        return input[wx_vxd_offset..].into();
+    if input[wx_vxd_offset] == b'W' && input[wx_vxd_offset + 1] == b'3' {
+        return (input[wx_vxd_offset..].into(), wx_vxd_offset);
     }
-    let chunk_count = u16::from_le_bytes(input[wx_vxd_offset+6..wx_vxd_offset+8].try_into().unwrap());
+    let chunk_count = u16::from_le_bytes(
+        input[wx_vxd_offset + 6..wx_vxd_offset + 8]
+            .try_into()
+            .unwrap(),
+    ) as usize;
     let mut result = vec![];
-    for index in 0..(chunk_count as usize) {
-        let offset = u32::from_le_bytes(input[wx_vxd_offset + 16 + 4*index..wx_vxd_offset + 16 + 4*index + 4].try_into().unwrap());
-        if index == 1 {
-            // Why is this chunk uncompressed?
-            result.append(&mut input[(offset as usize)..(offset as usize + 8192)].to_vec());
+    for index in 0..chunk_count {
+        let offset = w4_chunk_get_offset(&input, wx_vxd_offset, index);
+        if index < chunk_count - 1 && w4_chunk_get_offset(&input, wx_vxd_offset, index + 1) - offset == 8192 {
+            result.append(&mut input[offset..offset + 8192].to_vec());
         } else {
-            result.append(&mut ds_decode(&input[(offset as usize)..]));
+            result.append(&mut ds_decode(&input[offset..]));
         }
     }
-    result
+    (result, wx_vxd_offset)
 }

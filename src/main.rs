@@ -15,6 +15,8 @@ extern crate alloc;
 
 mod w4;
 mod w3;
+mod le;
+mod paging;
 
 fn read_file(path: &str) -> FileSystemResult<Vec<u8>> {
     let path: CString16 = CString16::try_from(path).unwrap();
@@ -33,10 +35,10 @@ fn main() -> Status {
     println!("registry size: {} bytes", registry.len());
     println!("kernel size: {} bytes", kernel.len());
 
-    let kernel_decompressed = w4::w4_to_w3(kernel);
+    let (kernel_decompressed, offset) = w4::w4_to_w3(kernel);
     println!("decompressed kernel size: {} bytes", kernel_decompressed.len());
 
-    w3::w3_load_vxds(kernel_decompressed);
+    w3::w3_load_vxds(kernel_decompressed, offset);
 
     loop {}
     //Status::SUCCESS
