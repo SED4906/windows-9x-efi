@@ -1,7 +1,7 @@
 use alloc::{string::String, vec::Vec};
 use uefi::println;
 
-use crate::paging::PageTable;
+use crate::{le::LinearExecutable, paging::PageTable};
 
 /// Load W3 VxD drivers
 /// # Parameters
@@ -15,14 +15,16 @@ pub fn w3_load_vxds(input: Vec<u8>, header_offset: usize) {
     let staging_page_table = unsafe { uefi::boot::allocate_pages(uefi::boot::AllocateType::AnyPages, uefi::boot::MemoryType::LOADER_DATA, 1).unwrap().cast::<PageTable>().as_mut() };
 
     let vxd_count = u16::from_le_bytes(input[4..6].try_into().unwrap());
+
+    let mut virtual_base = 0xC0000000;
     for index in 0..(vxd_count as usize) {
         let entry = &input[16 + 16*index..16 + 16*index + 16];
         let name = String::from_utf8_lossy(&entry[0..8]);
         let name = name.trim();
         let offset = (u32::from_le_bytes(entry[8..12].try_into().unwrap()) - (header_offset as u32)) as usize;
         let header_size = u32::from_le_bytes(entry[12..16].try_into().unwrap()) as usize;
-        println!("{name} -- offset {offset:X}h, header size {header_size}");
+        println!("-- {name} -- offset {offset:X}h, header size {header_size} ... virtual base {virtual_base}");
         // (actually load VxD)
-        crate::le::load_le(&input[offset..], header_size, 0xc0000000, staging_page_table);
+        virtual_base = LinearExecutable::new(&input[offset..]).load(header_size, virtual_base, staging_page_table);
     }
 }

@@ -3,198 +3,173 @@ use uefi::println;
 
 use crate::paging::PageTable;
 
-pub fn load_le(
-    input: &[u8],
-    header_size: usize,
-    virtual_address_base: u32,
-    page_table: &mut PageTable,
-) -> u32 {
-    if input[0] != b'L' || input[1] != b'E' {
-        panic!(
-            "not an LE signature: {:X}h {:X}h (expected 4Ch 45h)",
-            input[0], input[1]
-        );
-    }
-    let object_table_offset = u32::from_le_bytes(input[0x40..0x44].try_into().unwrap()) as usize;
-    let object_table_entries = u32::from_le_bytes(input[0x44..0x48].try_into().unwrap()) as usize;
-    let page_map_offset = u32::from_le_bytes(input[0x48..0x4C].try_into().unwrap()) as usize;
-    let fixup_page_table_offset =
-        u32::from_le_bytes(input[0x68..0x6C].try_into().unwrap()) as usize;
-    let fixup_record_table_offset =
-        u32::from_le_bytes(input[0x6C..0x70].try_into().unwrap()) as usize;
-    println!("{object_table_entries} objects");
+struct LEObject {
+    virtual_size: u32,
+    reloc_base: u32,
+    flags: u32,
+    page_table_index: u32,
+    page_table_entries: u32,
+    reserved: [u8; 4],
+}
 
-    let mut object_cursor = header_size;
+struct UnalignedU32 {
+    data: [u8; 4],
+}
 
-    let mut virtual_address_page = virtual_address_base;
+pub struct LinearExecutable<'a> {
+    page_size: usize,
+    object_table: &'a [LEObject],
+    object_page_table: *const UnalignedU32,
+    fixup_page_table: *const UnalignedU32,
+    fixup_record_table: *const u8,
+}
 
-    for index in 0..object_table_entries {
-        let virtual_segment_size = u32::from_le_bytes(
-            input[object_table_offset + index * 0x18..object_table_offset + index * 0x18 + 4]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let base_address = u32::from_le_bytes(
-            input[object_table_offset + index * 0x18 + 4..object_table_offset + index * 0x18 + 8]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let object_flags = u32::from_le_bytes(
-            input[object_table_offset + index * 0x18 + 8..object_table_offset + index * 0x18 + 12]
-                .try_into()
-                .unwrap(),
-        );
-        let page_map_index = u32::from_le_bytes(
-            input[object_table_offset + index * 0x18 + 12..object_table_offset + index * 0x18 + 16]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let page_map_entries = u32::from_le_bytes(
-            input[object_table_offset + index * 0x18 + 16..object_table_offset + index * 0x18 + 20]
-                .try_into()
-                .unwrap(),
-        ) as usize;
-        let segment_name = String::from_utf8_lossy(
-            &input
-                [object_table_offset + index * 0x18 + 20..object_table_offset + index * 0x18 + 24],
-        );
-        let segment_name = segment_name.trim_matches(['\0', '�']);
-        println!("segment {segment_name}: size {virtual_segment_size:X}h, address {base_address:X}h, flags {object_flags:X}h, index {page_map_index} entries {page_map_entries}");
-        let allocated_pages = uefi::boot::allocate_pages(
-            uefi::boot::AllocateType::AnyPages,
-            uefi::boot::MemoryType::LOADER_DATA,
-            page_map_entries,
-        )
-        .unwrap();
-        unsafe {
-            core::ptr::copy(
-                input.as_ptr().byte_add(object_cursor),
-                allocated_pages.as_ptr(),
-                virtual_segment_size,
+impl LinearExecutable<'_> {
+    pub fn new(input: &[u8]) -> Self {
+        if input[0] != b'L' || input[1] != b'E' {
+            panic!(
+                "not an LE signature: {:X}h {:X}h (expected 4Ch 45h)",
+                input[0], input[1]
             );
         }
-        object_cursor += virtual_segment_size;
+        let page_size = u32::from_le_bytes(input[0x28..0x2C].try_into().unwrap()) as usize;
+        let object_table_offset =
+            u32::from_le_bytes(input[0x40..0x44].try_into().unwrap()) as usize;
+        let object_table_entries =
+            u32::from_le_bytes(input[0x44..0x48].try_into().unwrap()) as usize;
+        let object_page_table_offset =
+            u32::from_le_bytes(input[0x48..0x4C].try_into().unwrap()) as usize;
+        let fixup_page_table_offset =
+            u32::from_le_bytes(input[0x68..0x6C].try_into().unwrap()) as usize;
+        let fixup_record_table_offset =
+            u32::from_le_bytes(input[0x6C..0x70].try_into().unwrap()) as usize;
 
-        let mut map_from_address = allocated_pages.as_ptr() as u32;
-        for index in page_map_index - 1..page_map_index - 1 + page_map_entries {
-            let page_number = u32::from_be_bytes(
-                input[page_map_offset + index * 4..page_map_offset + index * 4 + 4]
-                    .try_into()
-                    .unwrap(),
-            ) >> 8;
-            let map_to_address = virtual_address_page + page_number * 4096;
-            page_table.map_address(map_from_address, map_to_address, true, true, false);
-            map_from_address += 4096;
-        }
-        virtual_address_page += page_map_entries as u32 * 4096;
-
-        let mut fixup_cursor = fixup_record_table_offset
-            + u32::from_le_bytes(
-                input[fixup_page_table_offset + index * 4..fixup_page_table_offset + index * 4 + 4]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-        let fixup_limit = fixup_record_table_offset
-            + u32::from_le_bytes(
-                input[fixup_page_table_offset + (index + 1) * 4
-                    ..fixup_page_table_offset + (index + 1) * 4 + 4]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-        while fixup_cursor < fixup_limit {
-            let source_type = input[fixup_cursor];
-            let target_flags = input[fixup_cursor + 1];
-            fixup_cursor += 2;
-            match (source_type, target_flags) {
-                (0x7,0x0) => {
-                    let source_offset = u16::from_le_bytes(input[fixup_cursor..fixup_cursor+2].try_into().unwrap()) as isize;
-                    let object_number = input[fixup_cursor+3];
-                    let target_offset = u16::from_le_bytes(input[fixup_cursor+3..fixup_cursor+3+2].try_into().unwrap()) as usize;
-                    fixup_cursor += 5;
-                    println!("fixup offset32 in object {object_number} target offset {target_offset:04x}h: source offset {source_offset:x}h");
-                }
-                (0x8,0x0) => {
-                    let source_offset = u16::from_le_bytes(input[fixup_cursor..fixup_cursor+2].try_into().unwrap()) as isize;
-                    let object_number = input[fixup_cursor+3];
-                    let target_offset = u16::from_le_bytes(input[fixup_cursor+3..fixup_cursor+3+2].try_into().unwrap()) as usize;
-                    fixup_cursor += 5;
-                    println!("fixup self32 in object {object_number} target offset {target_offset:04x}h: source offset {source_offset:x}h");
-                }
-                (0x7,0x10) => {
-                    let source_offset = u16::from_le_bytes(input[fixup_cursor..fixup_cursor+2].try_into().unwrap()) as isize;
-                    let object_number = input[fixup_cursor+3];
-                    let target_offset = u32::from_le_bytes(input[fixup_cursor+3..fixup_cursor+3+4].try_into().unwrap()) as usize;
-                    fixup_cursor += 7;
-                    println!("fixup offset32 in object {object_number} target offset {target_offset:08x}h: source offset {source_offset:x}h");
-                }
-                (0x8,0x10) => {
-                    let source_offset = u16::from_le_bytes(input[fixup_cursor..fixup_cursor+2].try_into().unwrap()) as isize;
-                    let object_number = input[fixup_cursor+3];
-                    let target_offset = u32::from_le_bytes(input[fixup_cursor+3..fixup_cursor+3+4].try_into().unwrap()) as usize;
-                    fixup_cursor += 7;
-                    println!("fixup self32 in object {object_number} target offset {target_offset:08x}h: source offset {source_offset:x}h");
-                }
-                (0x27,0x0) => {
-                    let mut source_offsets = vec![];
-                    let source_offset_count = input[fixup_cursor];
-                    let object_number = input[fixup_cursor+1];
-                    let target_offset = u16::from_le_bytes(input[fixup_cursor+2..fixup_cursor+2+2].try_into().unwrap()) as usize;
-                    fixup_cursor += 4;
-                    println!("fixup offset32 in object {object_number} target offset {target_offset:04x}h...");
-                    for _ in 0..source_offset_count {
-                        let source_offset = u16::from_le_bytes(input[fixup_cursor..fixup_cursor+2].try_into().unwrap()) as isize;
-                        source_offsets.push(source_offset);
-                        fixup_cursor += 2;
-                        println!("source offset {source_offset:x}h");
-                    }
-                }
-                (0x28,0x0) => {
-                    let mut source_offsets = vec![];
-                    let source_offset_count = input[fixup_cursor];
-                    let object_number = input[fixup_cursor+1];
-                    let target_offset = u16::from_le_bytes(input[fixup_cursor+2..fixup_cursor+2+2].try_into().unwrap()) as usize;
-                    fixup_cursor += 4;
-                    println!("fixup self32 in object {object_number} target offset {target_offset:04x}h...");
-                    for _ in 0..source_offset_count {
-                        let source_offset = u16::from_le_bytes(input[fixup_cursor..fixup_cursor+2].try_into().unwrap()) as isize;
-                        source_offsets.push(source_offset);
-                        fixup_cursor += 2;
-                        println!("source offset {source_offset:x}h");
-                    }
-                }
-                (0x27,0x10) => {
-                    let mut source_offsets = vec![];
-                    let source_offset_count = input[fixup_cursor];
-                    let object_number = input[fixup_cursor+1];
-                    let target_offset = u32::from_le_bytes(input[fixup_cursor+2..fixup_cursor+2+4].try_into().unwrap()) as usize;
-                    fixup_cursor += 6;
-                    println!("fixup offset32 in object {object_number} target offset {target_offset:08x}h...");
-                    for _ in 0..source_offset_count {
-                        let source_offset = u16::from_le_bytes(input[fixup_cursor..fixup_cursor+2].try_into().unwrap()) as isize;
-                        source_offsets.push(source_offset);
-                        fixup_cursor += 2;
-                        println!("source offset {source_offset:x}h");
-                    }
-                }
-                (0x28,0x10) => {
-                    let mut source_offsets = vec![];
-                    let source_offset_count = input[fixup_cursor];
-                    let object_number = input[fixup_cursor+1];
-                    let target_offset = u32::from_le_bytes(input[fixup_cursor+2..fixup_cursor+2+4].try_into().unwrap()) as usize;
-                    fixup_cursor += 6;
-                    println!("fixup self32 in object {object_number} target offset {target_offset:08x}h...");
-                    for _ in 0..source_offset_count {
-                        let source_offset = u16::from_le_bytes(input[fixup_cursor..fixup_cursor+2].try_into().unwrap()) as isize;
-                        source_offsets.push(source_offset);
-                        fixup_cursor += 2;
-                        println!("source offset {source_offset:x}h");
-                    }
-                }
-
-                (_,_) => panic!("unsure what fixup source type {source_type:x}h with target flags {target_flags:x}h means at {fixup_cursor:x}h"),
-            }
+        let object_table = unsafe {
+            core::slice::from_raw_parts(
+                &raw const input[object_table_offset] as *const LEObject,
+                object_table_entries,
+            )
+        };
+        let object_page_table = &raw const input[object_page_table_offset] as *const UnalignedU32;
+        let fixup_page_table = &raw const input[fixup_page_table_offset] as *const UnalignedU32;
+        let fixup_record_table = &raw const input[fixup_record_table_offset];
+        Self {
+            page_size,
+            object_table,
+            object_page_table,
+            fixup_page_table,
+            fixup_record_table,
         }
     }
 
-    virtual_address_page
+    pub fn load(&self, header_size: usize, virtual_base: u32, page_table: &mut PageTable) -> u32 {
+        let mut virtual_page = virtual_base;
+        println!(
+            "({} page size | {} objects)",
+            self.page_size,
+            self.object_table.len()
+        );
+        for object in self.object_table {
+            let object_name = String::from_utf8_lossy(&object.reserved);
+            let object_name = object_name.trim_matches(['\0', '�']);
+            println!(
+                "object {object_name}: size {:X}h, base {:X}h, flags {:X}h, index {} entries {}",
+                object.virtual_size,
+                object.reloc_base,
+                object.flags,
+                object.page_table_index,
+                object.page_table_entries
+            );
+            let page_table_slice = unsafe {
+                core::slice::from_raw_parts(
+                    self.object_page_table
+                        .add(object.page_table_index as usize - 1),
+                    object.page_table_entries as usize,
+                )
+            };
+            let fixup_page_table_slice = unsafe {
+                core::slice::from_raw_parts(
+                    self.fixup_page_table
+                        .add(object.page_table_index as usize - 1),
+                    object.page_table_entries as usize + 1,
+                )
+            };
+            for index in 0..page_table_slice.len() {
+                let page = u32::from_be_bytes(page_table_slice[index].data); // why is this big endian? is it even?
+                let page_number = page >> 8;
+                let page_flags = page & 0xFF;
+                if page_flags == 0 {
+                    // copy page from offset
+                } else if page_flags == 1 {
+                    // whatever an "iterated data page" is
+                } else if page_flags == 2 || page_flags == 3 {
+                    // zero-filled page
+                } else if page_flags == 4 {
+                    // range of pages?
+                } else {
+                    println!("??? page {:X}h flags {:X}h ???", page_number, page_flags);
+                    panic!("that can't be right...");
+                }
+                let fixup_start = u32::from_le_bytes(fixup_page_table_slice[index].data) as usize;
+                let fixup_limit = u32::from_le_bytes(fixup_page_table_slice[index+1].data) as usize;
+                let fixup_records = unsafe { core::slice::from_raw_parts(self.fixup_record_table.add(fixup_start), fixup_limit - fixup_start) };
+                let mut fixup_cursor = 0;
+                while fixup_cursor < fixup_records.len() {
+                    let source_type = fixup_records[fixup_cursor];
+                    let target_flags = fixup_records[fixup_cursor+1];
+                    fixup_cursor += 2;
+                    let mut source_offsets = vec![];
+                    let source_offset_count = if source_type & 0x20 == 0 {
+                        let source_offset = i16::from_le_bytes([fixup_records[fixup_cursor],fixup_records[fixup_cursor+1]]);
+                        source_offsets.push(source_offset);
+                        fixup_cursor += 2;
+                        0
+                    } else {
+                        let count = fixup_records[fixup_cursor];
+                        fixup_cursor += 1;
+                        count
+                    };
+                    let target_object_number = if target_flags & 0x40 == 0 {
+                        let value = fixup_records[fixup_cursor] as u16;
+                        fixup_cursor += 1;
+                        value
+                    } else {
+                        let value = u16::from_le_bytes([fixup_records[fixup_cursor],fixup_records[fixup_cursor+1]]);
+                        fixup_cursor += 2;
+                        value
+                    };
+                    let target_offset = if target_flags & 0x10 == 0 {
+                        let value = u16::from_le_bytes([fixup_records[fixup_cursor],fixup_records[fixup_cursor+1]]) as u32;
+                        fixup_cursor += 2;
+                        value
+                    } else {
+                        let value = u32::from_le_bytes([fixup_records[fixup_cursor],fixup_records[fixup_cursor+1],fixup_records[fixup_cursor+2],fixup_records[fixup_cursor+3]]);
+                        fixup_cursor += 4;
+                        value
+                    };
+                    for _ in 0..source_offset_count {
+                        let source_offset = i16::from_le_bytes([fixup_records[fixup_cursor],fixup_records[fixup_cursor+1]]);
+                        source_offsets.push(source_offset);
+                        fixup_cursor += 2;
+                    }
+                    let target_object_name = String::from_utf8_lossy(&self.object_table[target_object_number as usize - 1].reserved);
+                    let target_object_name = target_object_name.trim_matches(['\0', '�']);
+                    println!("fixup type {source_type:X}h flags {target_flags:X}h target object {target_object_number:X}h ({target_object_name}) @ offset {target_offset:X}h");
+                    for source_offset in source_offsets {
+                        println!("  source offset @ {source_offset:X}h");
+                    }
+                }
+            }
+            virtual_page += object.page_table_entries * 4096;
+        }
+        virtual_page
+    }
+}
+
+fn set_unaligned_u32(address: u32, value: u32) {
+    unsafe {
+        *(address as *mut UnalignedU32) = UnalignedU32 {
+            data: value.to_le_bytes(),
+        }
+    };
 }
